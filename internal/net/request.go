@@ -56,6 +56,13 @@ type Downloader struct {
 	// arrived for this long (waiting for headers included). Zero disables it.
 	PartStallTimeout time.Duration
 
+	// HeadParts parts of HeadPartSize bytes start each download, before the
+	// PartSize parts. A reader that needs the first few MB soon (a player
+	// opening or seeking) then gets them from several connections instead
+	// of one. Zero, or a HeadPartSize not below PartSize, disables it.
+	HeadParts    int
+	HeadPartSize int
+
 	//RequestParam        HttpRequestParams
 	HttpClient HttpRequestFunc
 
@@ -100,6 +107,9 @@ func (d Downloader) Download(ctx context.Context, p *HttpRequestParams) (readClo
 	}
 	if impl.cfg.HttpClient == nil {
 		impl.cfg.HttpClient = DefaultHttpRequestFunc
+	}
+	if impl.cfg.HeadParts <= 0 || impl.cfg.HeadPartSize <= 0 || impl.cfg.HeadPartSize >= impl.cfg.PartSize {
+		impl.cfg.HeadParts, impl.cfg.HeadPartSize = 0, 0
 	}
 
 	return impl.download()
@@ -166,10 +176,7 @@ func (d *downloader) download() (io.ReadCloser, error) {
 		return nil, err
 	}
 
-	maxPart := 1
-	if d.params.Range.Length > int64(d.cfg.PartSize) {
-		maxPart = int((d.params.Range.Length + int64(d.cfg.PartSize) - 1) / int64(d.cfg.PartSize))
-	}
+	maxPart := d.partCount()
 	if maxPart < d.cfg.Concurrency {
 		d.cfg.Concurrency = maxPart
 	}
@@ -222,6 +229,52 @@ func (d *downloader) download() (io.ReadCloser, error) {
 	return &multiReadCloser{d: d, curBuf: d.popBuf(0), maxPos: maxPart}, nil
 }
 
+// partCount is the number of parts the range is split into: HeadParts
+// parts of HeadPartSize (if set), then PartSize parts, the last one short.
+func (d *downloader) partCount() int {
+	length, size := d.params.Range.Length, int64(d.cfg.PartSize)
+	if d.cfg.HeadParts > 0 {
+		head := int64(d.cfg.HeadPartSize)
+		if length <= int64(d.cfg.HeadParts)*head {
+			return max(1, int((length+head-1)/head))
+		}
+		rest := length - int64(d.cfg.HeadParts)*head
+		return d.cfg.HeadParts + int((rest+size-1)/size)
+	}
+	if length <= size {
+		return 1
+	}
+	return int((length + size - 1) / size)
+}
+
+// chunkSize is the size of the next part, d.nextChunk at d.pos.
+func (d *downloader) chunkSize() int64 {
+	finalSize := int64(d.cfg.PartSize)
+	if d.cfg.HeadParts > 0 {
+		if d.nextChunk < d.cfg.HeadParts {
+			finalSize = int64(d.cfg.HeadPartSize)
+		}
+		return min(finalSize, d.maxPos-d.pos)
+	}
+	switch d.nextChunk {
+	case 0:
+		// 最小分片在前面有助视频播放？
+		firstSize := d.params.Range.Length % finalSize
+		if firstSize > 0 {
+			minSize := finalSize / 2
+			// 最小分片太小就调整到一半
+			finalSize = max(firstSize, minSize)
+		}
+	case 1:
+		firstSize := d.params.Range.Length % finalSize
+		minSize := finalSize / 2
+		if firstSize > 0 && firstSize < minSize {
+			finalSize += firstSize - minSize
+		}
+	}
+	return finalSize
+}
+
 func (d *downloader) sendChunkTask(newConcurrency bool) (err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -255,23 +308,7 @@ func (d *downloader) sendChunkTask(newConcurrency bool) (err error) {
 		d.bufMap[d.nextChunk] = br
 	}
 
-	finalSize := int64(d.cfg.PartSize)
-	switch d.nextChunk {
-	case 0:
-		// 最小分片在前面有助视频播放？
-		firstSize := d.params.Range.Length % finalSize
-		if firstSize > 0 {
-			minSize := finalSize / 2
-			// 最小分片太小就调整到一半
-			finalSize = max(firstSize, minSize)
-		}
-	case 1:
-		firstSize := d.params.Range.Length % finalSize
-		minSize := finalSize / 2
-		if firstSize > 0 && firstSize < minSize {
-			finalSize += firstSize - minSize
-		}
-	}
+	finalSize := d.chunkSize()
 	err = br.Reset(int(finalSize))
 	if err != nil {
 		return err // 分片算法错误或者下载中断
