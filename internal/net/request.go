@@ -389,7 +389,7 @@ func (d *downloader) downloadChunk(ch *chunk) bool {
 		n, err = d.tryDownloadChunk(params, ch)
 		if err == nil {
 			d.incrWritten(n)
-			log.Debugf("chunk_%d downloaded", ch.id)
+			log.Debugf("chunk_%d downloaded %v", ch.id, ch.timing)
 			return true
 		}
 		if d.ctx.Err() != nil {
@@ -411,6 +411,7 @@ func (d *downloader) downloadChunk(ch *chunk) bool {
 			}
 			log.Warnf("err chunk_%d, object part download error %s, retrying attempt %d. %v",
 				ch.id, params.URL, retry, err)
+			log.Debugf("chunk_%d failed attempt %v", ch.id, ch.timing)
 		} else if err == errInfiniteRetry {
 			retry--
 		} else if err == errCancelConcurrency {
@@ -550,12 +551,9 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 	_ = d.sendChunkTask(true)
 	headers := time.Since(start)
 	n, err := utils.CopyWithBuffer(w, resp.Body)
-	if log.IsLevelEnabled(log.DebugLevel) {
-		el := time.Since(start)
-		log.Debugf("chunk_%d range %d+%d: %d bytes, headers %.2fs, total %.2fs, %.2f MB/s, reused conn %v, err %v",
-			ch.id, params.Range.Start, params.Range.Length, n, headers.Seconds(), el.Seconds(),
-			float64(n)/el.Seconds()/float64(utils.MB), reused, err)
-	}
+	// logged by downloadChunk after the bytes are counted, so logging
+	// never delays d.written behind the reader
+	ch.timing = partTiming{start: params.Range.Start, n: n, headers: headers, total: time.Since(start), reused: reused}
 
 	if err != nil {
 		if stalled.Load() && d.ctx.Err() == nil {
@@ -630,6 +628,20 @@ type chunk struct {
 	id    int
 
 	newConcurrency bool
+	timing         partTiming // last attempt, for debug logging
+}
+
+type partTiming struct {
+	start          int64
+	n              int64
+	headers, total time.Duration
+	reused         bool
+}
+
+func (t partTiming) String() string {
+	return fmt.Sprintf("from %d: %d bytes, headers %.2fs, total %.2fs, %.2f MB/s, reused conn %v",
+		t.start, t.n, t.headers.Seconds(), t.total.Seconds(),
+		float64(t.n)/max(t.total.Seconds(), 1e-6)/float64(utils.MB), t.reused)
 }
 
 func DefaultHttpRequestFunc(ctx context.Context, params *HttpRequestParams) (*http.Response, error) {
