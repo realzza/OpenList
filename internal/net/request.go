@@ -8,7 +8,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
-	"net/http/httptrace"
 	stdpath "path"
 	"strconv"
 	"sync"
@@ -63,6 +62,15 @@ type Downloader struct {
 	HeadParts    int
 	HeadPartSize int
 
+	// EdgeFailover races a second edge cluster when a connection isn't up
+	// within this long (see WithEdgeFailover). Zero disables it.
+	EdgeFailover time.Duration
+
+	// HeaderTimeout hedges a part request that has no response headers this
+	// long after it was sent: a second request goes out and the first to
+	// answer is used. Zero disables it.
+	HeaderTimeout time.Duration
+
 	//RequestParam        HttpRequestParams
 	HttpClient HttpRequestFunc
 
@@ -91,6 +99,9 @@ func (d Downloader) Download(ctx context.Context, p *HttpRequestParams) (readClo
 	awsutil.Copy(&finalP, p)
 	if finalP.Range.Length < 0 || finalP.Range.Start+finalP.Range.Length > finalP.Size {
 		finalP.Range.Length = finalP.Size - finalP.Range.Start
+	}
+	if d.EdgeFailover > 0 {
+		ctx = WithEdgeFailover(ctx, d.EdgeFailover)
 	}
 	impl := downloader{params: &finalP, cfg: d, ctx: ctx}
 
@@ -182,7 +193,10 @@ func (d *downloader) download() (io.ReadCloser, error) {
 	}
 	log.Debugf("cfgConcurrency:%d", d.cfg.Concurrency)
 
-	if maxPart == 1 {
+	// A single part goes straight through, without the timeouts and retries
+	// below, unless edge failover or hedging is on: then a short request (a
+	// player's index probe) gets them too.
+	if maxPart == 1 && !d.retriesNetErrors() {
 		resp, err := d.cfg.HttpClient(d.ctx, d.params)
 		if err != nil {
 			d.cfg.ConcurrencyLimit.Release()
@@ -247,6 +261,13 @@ func (d *downloader) partCount() int {
 	return int((length + size - 1) / size)
 }
 
+// retriesNetErrors: with edge failover or hedging on, a part whose request
+// fails without an HTTP status (connect or TLS timeout, reset) is retried
+// like a stalled one instead of failing the whole download.
+func (d *downloader) retriesNetErrors() bool {
+	return d.cfg.EdgeFailover > 0 || d.cfg.HeaderTimeout > 0
+}
+
 // chunkSize is the size of the next part, d.nextChunk at d.pos.
 func (d *downloader) chunkSize() int64 {
 	finalSize := int64(d.cfg.PartSize)
@@ -272,7 +293,8 @@ func (d *downloader) chunkSize() int64 {
 			finalSize += firstSize - minSize
 		}
 	}
-	return finalSize
+	// only a range of a single short part reaches past its end here
+	return min(finalSize, d.maxPos-d.pos)
 }
 
 func (d *downloader) sendChunkTask(newConcurrency bool) (err error) {
@@ -584,24 +606,26 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 		})
 	}
 	start := time.Now()
-	reused := false
-	if log.IsLevelEnabled(log.DebugLevel) {
-		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-			GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
-		})
-	}
-
-	resp, err := d.cfg.HttpClient(ctx, params)
+	resp, trace, done, err := d.request(ctx, params, ch)
+	defer done()
+	ch.timing = partTiming{start: params.Range.Start, headers: time.Since(start), total: time.Since(start), trace: trace}
 	if err != nil && (stalled.Load() || slow.Load()) && d.ctx.Err() == nil {
 		if slow.Load() {
 			return 0, &errNeedRetry{errPartSlow}
 		}
-		log.Debugf("chunk_%d no response within %v, retrying", ch.id, d.cfg.PartStallTimeout)
+		log.Debugf("chunk_%d no response within %v, retrying; %v", ch.id, d.cfg.PartStallTimeout, trace)
 		return 0, &errNeedRetry{errPartStalled}
 	}
 	if err != nil {
 		statusCode, ok := errs.UnwrapOrSelf(err).(HttpStatusCodeError)
 		if !ok {
+			if d.retriesNetErrors() && d.ctx.Err() == nil {
+				log.Debugf("chunk_%d request failed, retrying: %v; %v", ch.id, err, trace)
+				if !d.delay(time.Millisecond * time.Duration(rand.Uint32N(300)+200)) {
+					return 0, errCancelConcurrency
+				}
+				return 0, &errNeedRetry{err}
+			}
 			return 0, err
 		}
 		if statusCode == http.StatusRequestedRangeNotSatisfiable {
@@ -667,7 +691,7 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 	n, err := utils.CopyWithBuffer(w, resp.Body)
 	// logged by downloadChunk after the bytes are counted, so logging
 	// never delays d.written behind the reader
-	ch.timing = partTiming{start: params.Range.Start, n: n, headers: headers, total: time.Since(start), reused: reused}
+	ch.timing = partTiming{start: params.Range.Start, n: n, headers: headers, total: time.Since(start), trace: trace}
 
 	if err != nil {
 		if d.ctx.Err() == nil {
@@ -753,13 +777,17 @@ type partTiming struct {
 	start          int64
 	n              int64
 	headers, total time.Duration
-	reused         bool
+	trace          *partTrace
 }
 
 func (t partTiming) String() string {
-	return fmt.Sprintf("from %d: %d bytes, headers %.2fs, total %.2fs, %.2f MB/s, reused conn %v",
+	s := fmt.Sprintf("from %d: %d bytes, headers %.2fs, total %.2fs, %.2f MB/s, reused conn %v",
 		t.start, t.n, t.headers.Seconds(), t.total.Seconds(),
-		float64(t.n)/max(t.total.Seconds(), 1e-6)/float64(utils.MB), t.reused)
+		float64(t.n)/max(t.total.Seconds(), 1e-6)/float64(utils.MB), t.trace.wasReused())
+	if t.trace != nil {
+		s += ", " + t.trace.String()
+	}
+	return s
 }
 
 func DefaultHttpRequestFunc(ctx context.Context, params *HttpRequestParams) (*http.Response, error) {

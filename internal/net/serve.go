@@ -303,7 +303,11 @@ func RequestHttp(ctx context.Context, httpMethod string, headerOverride http.Hea
 		return nil, err
 	}
 	req.Header = headerOverride
-	res, err := HttpClient().Do(req)
+	client := HttpClient()
+	if edgeFailoverFrom(ctx) > 0 {
+		client = EdgeHttpClient()
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

@@ -18,6 +18,8 @@ type Addition struct {
 	DownHeadParts         int    `json:"down_head_parts" type:"number" default:"0" help:"number of smaller parts at the start of each proxied download, so a player opening or seeking gets its first MB from several connections; 0 disables"`
 	DownHeadPartSize      int    `json:"down_head_part_size" type:"number" default:"3" help:"size of those first parts, in MB (below down_part_size)"`
 	DownLinkCache         int    `json:"down_link_cache" type:"number" default:"0" help:"seconds to reuse a download link across requests for the same file (players open a file with several requests); 0 refetches it for each request"`
+	DownEdgeFailover      int    `json:"down_edge_failover" type:"number" default:"0" help:"milliseconds before a CDN connection that isn't up is raced by one to another edge cluster (some clusters don't answer from far away); 0 disables"`
+	DownHeaderTimeout     int    `json:"down_header_timeout" type:"number" default:"0" help:"seconds without response headers before a range request is hedged with a second one; 0 disables"`
 	AdditionVersion       int
 }
 

@@ -41,6 +41,10 @@ type Link struct {
 	// start each download with HeadParts parts of HeadPartSize bytes; 0 = off
 	HeadParts    int `json:"-"`
 	HeadPartSize int `json:"-"`
+	// race another edge cluster when a connection isn't up this long; 0 = off
+	EdgeFailover time.Duration `json:"-"`
+	// hedge a part request without response headers this long; 0 = off
+	HeaderTimeout time.Duration `json:"-"`
 
 	utils.SyncClosers `json:"-"`
 	// 如果SyncClosers中的资源被关闭后Link将不可用，则此值应为 true
@@ -58,6 +62,8 @@ func (l *Link) Clone() *Link {
 		PartStallTimeout: l.PartStallTimeout,
 		HeadParts:        l.HeadParts,
 		HeadPartSize:     l.HeadPartSize,
+		EdgeFailover:     l.EdgeFailover,
+		HeaderTimeout:    l.HeaderTimeout,
 		ContentLength:    l.ContentLength,
 		SyncClosers:      utils.NewSyncClosers(l),
 		RequireReference: l.RequireReference,
