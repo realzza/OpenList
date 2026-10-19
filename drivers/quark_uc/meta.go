@@ -15,6 +15,7 @@ type Addition struct {
 	DownConcurrency       int    `json:"down_concurrency" type:"number" default:"3" help:"parallel range requests per proxied download (1-16)"`
 	DownPartSize          int    `json:"down_part_size" type:"number" default:"10" help:"size of each range request, in MB"`
 	DownStallTimeout      int    `json:"down_stall_timeout" type:"number" default:"0" help:"seconds without data before a range request is resumed on a new connection; 0 disables"`
+	DownLinkCache         int    `json:"down_link_cache" type:"number" default:"0" help:"seconds to reuse a download link across requests for the same file (players open a file with several requests); 0 refetches it for each request"`
 	AdditionVersion       int
 }
 

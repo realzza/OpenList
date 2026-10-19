@@ -116,10 +116,12 @@ func (d *QuarkOrUC) getDownloadLink(file model.Obj) (*model.Link, error) {
 	}
 	var resp DownResp
 	ua := d.conf.ua
+	start := time.Now()
 	_, err := d.request("/file/download", http.MethodPost, func(req *resty.Request) {
 		req.SetHeader("User-Agent", ua).
 			SetBody(data)
 	}, &resp)
+	log.Debugf("quark file/download took %.2fs", time.Since(start).Seconds())
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +136,7 @@ func (d *QuarkOrUC) getDownloadLink(file model.Obj) (*model.Link, error) {
 		Concurrency:      d.downConcurrency(),
 		PartSize:         d.downPartSize(),
 		PartStallTimeout: d.downStallTimeout(),
+		Expiration:       d.downLinkCache(),
 	}, nil
 }
 
@@ -154,6 +157,18 @@ func (d *QuarkOrUC) downPartSize() int {
 
 func (d *QuarkOrUC) downStallTimeout() time.Duration {
 	return time.Duration(max(d.DownStallTimeout, 0)) * time.Second
+}
+
+// downLinkCache lets op.Link keep the link for this long instead of only
+// while a request holds it. A player opens a file with several requests in a
+// row (header, index, stream, then one per seek), and each would otherwise
+// cost a file/download call. The URL itself stays valid far longer.
+func (d *QuarkOrUC) downLinkCache() *time.Duration {
+	if d.DownLinkCache <= 0 {
+		return nil
+	}
+	ttl := time.Duration(d.DownLinkCache) * time.Second
+	return &ttl
 }
 
 func (d *QuarkOrUC) getTranscodingLink(file model.Obj) (*model.Link, error) {
