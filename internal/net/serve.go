@@ -172,6 +172,13 @@ func ServeHTTP(w http.ResponseWriter, r *http.Request, name string, modTime time
 		}()
 	}
 	defer func() {
+		if r.Method == http.MethodHead {
+			// No body is sent, so the reader is closed unread. A ranged
+			// multi-thread reader reports that as "interrupted", which
+			// must not turn a successful HEAD into a 500.
+			_ = sendContent.Close()
+			return
+		}
 		err = closeWithError(err, sendContent)
 	}()
 
