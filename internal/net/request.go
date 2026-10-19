@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptrace"
@@ -124,7 +125,8 @@ type downloader struct {
 	pos         int64
 	maxPos      int64
 	delayMu     sync.Mutex
-	readingID   atomic.Int64 // 正在被读取的id
+	readingID   atomic.Int64  // 正在被读取的id
+	partRate    atomic.Uint64 // float64 bits: moving average of finished parts' bytes/s
 
 	hc *hcache.HybridCache
 }
@@ -389,6 +391,7 @@ func (d *downloader) downloadChunk(ch *chunk) bool {
 		n, err = d.tryDownloadChunk(params, ch)
 		if err == nil {
 			d.incrWritten(n)
+			d.notePartRate(ch.timing)
 			log.Debugf("chunk_%d downloaded %v", ch.id, ch.timing)
 			return true
 		}
@@ -439,20 +442,84 @@ func (d *downloader) delay(ti time.Duration) bool {
 
 var errCancelConcurrency = errors.New("")
 var errPartStalled = errors.New("no data within the part stall timeout")
+var errPartSlow = errors.New("part being read is too slow, resuming on a new connection")
 
 // progressWriter pushes the stall deadline back whenever data arrives.
 type progressWriter struct {
 	w       io.Writer
 	timer   *time.Timer
 	timeout time.Duration
+	written atomic.Int64
 }
 
 func (p *progressWriter) Write(b []byte) (int, error) {
 	n, err := p.w.Write(b)
 	if n > 0 {
+		p.written.Add(int64(n))
 		p.timer.Reset(p.timeout)
 	}
 	return n, err
+}
+
+// notePartRate folds a finished part's speed into the moving average that
+// watchSlowHead compares against. Tiny parts say little about speed.
+func (d *downloader) notePartRate(t partTiming) {
+	if t.n < 1<<20 || t.total <= 0 {
+		return
+	}
+	rate := float64(t.n) / t.total.Seconds()
+	for {
+		old := d.partRate.Load()
+		avg := math.Float64frombits(old)
+		next := rate
+		if avg > 0 {
+			next = 0.7*avg + 0.3*rate
+		}
+		if d.partRate.CompareAndSwap(old, math.Float64bits(next)) {
+			return
+		}
+	}
+}
+
+// watchSlowHead resumes the part the reader is waiting on when it runs far
+// below the speed other parts have been getting. Parts are read in order, so
+// one connection trickling at a fraction of its siblings' speed holds up the
+// whole stream. Only the head part is judged, and only relative to recent
+// parts, so a uniformly slow network does not cause restarts. The window
+// is half the stall timeout, after a grace period of 0.6 of it.
+func (d *downloader) watchSlowHead(id int, pw *progressWriter, done <-chan struct{}, abort func()) {
+	window := d.cfg.PartStallTimeout / 2
+	grace := d.cfg.PartStallTimeout * 6 / 10
+	tick := time.NewTicker(window / 5)
+	defer tick.Stop()
+	start := time.Now()
+	type sample struct {
+		at time.Time
+		n  int64
+	}
+	var samples []sample
+	for {
+		select {
+		case <-done:
+			return
+		case now := <-tick.C:
+			samples = append(samples, sample{now, pw.written.Load()})
+			for len(samples) > 1 && now.Sub(samples[1].at) >= window {
+				samples = samples[1:]
+			}
+			if int64(id) != d.readingID.Load() || now.Sub(start) < grace || now.Sub(samples[0].at) < window*4/5 {
+				continue
+			}
+			avg := math.Float64frombits(d.partRate.Load())
+			recent := float64(samples[len(samples)-1].n-samples[0].n) / now.Sub(samples[0].at).Seconds()
+			if avg > 0 && recent < avg/4 {
+				log.Debugf("chunk_%d at %.2f MB/s while parts average %.2f MB/s", id,
+					recent/float64(utils.MB), avg/float64(utils.MB))
+				abort()
+				return
+			}
+		}
+	}
 }
 
 var errInfiniteRetry = errors.New("")
@@ -460,7 +527,7 @@ var errInfiniteRetry = errors.New("")
 func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int64, error) {
 	ctx := d.ctx
 	var w io.Writer = ch.buf
-	var stalled atomic.Bool
+	var stalled, slow atomic.Bool
 	if d.cfg.PartStallTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(d.ctx)
@@ -470,7 +537,14 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 			cancel()
 		})
 		defer timer.Stop()
-		w = &progressWriter{w: ch.buf, timer: timer, timeout: d.cfg.PartStallTimeout}
+		pw := &progressWriter{w: ch.buf, timer: timer, timeout: d.cfg.PartStallTimeout}
+		w = pw
+		done := make(chan struct{})
+		defer close(done)
+		go d.watchSlowHead(ch.id, pw, done, func() {
+			slow.Store(true)
+			cancel()
+		})
 	}
 	start := time.Now()
 	reused := false
@@ -481,7 +555,10 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 	}
 
 	resp, err := d.cfg.HttpClient(ctx, params)
-	if err != nil && stalled.Load() && d.ctx.Err() == nil {
+	if err != nil && (stalled.Load() || slow.Load()) && d.ctx.Err() == nil {
+		if slow.Load() {
+			return 0, &errNeedRetry{errPartSlow}
+		}
 		log.Debugf("chunk_%d no response within %v, retrying", ch.id, d.cfg.PartStallTimeout)
 		return 0, &errNeedRetry{errPartStalled}
 	}
@@ -556,8 +633,12 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 	ch.timing = partTiming{start: params.Range.Start, n: n, headers: headers, total: time.Since(start), reused: reused}
 
 	if err != nil {
-		if stalled.Load() && d.ctx.Err() == nil {
-			err = errPartStalled
+		if d.ctx.Err() == nil {
+			if slow.Load() {
+				err = errPartSlow
+			} else if stalled.Load() {
+				err = errPartStalled
+			}
 		}
 		return n, &errNeedRetry{err}
 	}
