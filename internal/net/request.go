@@ -137,6 +137,7 @@ type downloader struct {
 	delayMu     sync.Mutex
 	readingID   atomic.Int64  // 正在被读取的id
 	partRate    atomic.Uint64 // float64 bits: moving average of finished parts' bytes/s
+	headSent    atomic.Bool   // the head parts have been requested together
 
 	hc *hcache.HybridCache
 }
@@ -663,6 +664,13 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 		}
 	}
 	_ = d.sendChunkTask(true)
+	if d.cfg.HeadParts > 2 && d.headSent.CompareAndSwap(false, true) {
+		// The link answers, so request the rest of the head now rather than
+		// one more part per answered request: it then fills in parallel.
+		for range d.cfg.HeadParts - 2 {
+			_ = d.sendChunkTask(true)
+		}
+	}
 	headers := time.Since(start)
 	n, err := utils.CopyWithBuffer(w, resp.Body)
 	// logged by downloadChunk after the bytes are counted, so logging
