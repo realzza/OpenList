@@ -131,8 +131,9 @@ func (d *QuarkOrUC) getDownloadLink(file model.Obj) (*model.Link, error) {
 			"Referer":    []string{d.conf.referer},
 			"User-Agent": []string{ua},
 		},
-		Concurrency: d.downConcurrency(),
-		PartSize:    d.downPartSize(),
+		Concurrency:      d.downConcurrency(),
+		PartSize:         d.downPartSize(),
+		PartStallTimeout: d.downStallTimeout(),
 	}, nil
 }
 
@@ -149,6 +150,10 @@ func (d *QuarkOrUC) downPartSize() int {
 		return 10 * utils.MB
 	}
 	return d.DownPartSize * utils.MB
+}
+
+func (d *QuarkOrUC) downStallTimeout() time.Duration {
+	return time.Duration(max(d.DownStallTimeout, 0)) * time.Second
 }
 
 func (d *QuarkOrUC) getTranscodingLink(file model.Obj) (*model.Link, error) {
@@ -171,10 +176,11 @@ func (d *QuarkOrUC) getTranscodingLink(file model.Obj) (*model.Link, error) {
 	for _, info := range resp.Data.VideoList {
 		if info.VideoInfo.URL != "" {
 			return &model.Link{
-				URL:           info.VideoInfo.URL,
-				ContentLength: info.VideoInfo.Size,
-				Concurrency:   d.downConcurrency(),
-				PartSize:      d.downPartSize(),
+				URL:              info.VideoInfo.URL,
+				ContentLength:    info.VideoInfo.Size,
+				Concurrency:      d.downConcurrency(),
+				PartSize:         d.downPartSize(),
+				PartStallTimeout: d.downStallTimeout(),
 			}, nil
 		}
 	}

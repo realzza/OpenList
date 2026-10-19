@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/http/httptrace"
 	stdpath "path"
 	"strconv"
 	"sync"
@@ -49,6 +50,10 @@ type Downloader struct {
 	//
 	// Concurrency of 1 will download the parts sequentially.
 	Concurrency int
+
+	// PartStallTimeout resumes a part on a new connection when no data has
+	// arrived for this long (waiting for headers included). Zero disables it.
+	PartStallTimeout time.Duration
 
 	//RequestParam        HttpRequestParams
 	HttpClient HttpRequestFunc
@@ -384,7 +389,7 @@ func (d *downloader) downloadChunk(ch *chunk) bool {
 		n, err = d.tryDownloadChunk(params, ch)
 		if err == nil {
 			d.incrWritten(n)
-			log.Debugf("chunk_%d downloaded", ch.id)
+			log.Debugf("chunk_%d downloaded %v", ch.id, ch.timing)
 			return true
 		}
 		if d.ctx.Err() != nil {
@@ -406,6 +411,7 @@ func (d *downloader) downloadChunk(ch *chunk) bool {
 			}
 			log.Warnf("err chunk_%d, object part download error %s, retrying attempt %d. %v",
 				ch.id, params.URL, retry, err)
+			log.Debugf("chunk_%d failed attempt %v", ch.id, ch.timing)
 		} else if err == errInfiniteRetry {
 			retry--
 		} else if err == errCancelConcurrency {
@@ -432,10 +438,53 @@ func (d *downloader) delay(ti time.Duration) bool {
 }
 
 var errCancelConcurrency = errors.New("")
+var errPartStalled = errors.New("no data within the part stall timeout")
+
+// progressWriter pushes the stall deadline back whenever data arrives.
+type progressWriter struct {
+	w       io.Writer
+	timer   *time.Timer
+	timeout time.Duration
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	if n > 0 {
+		p.timer.Reset(p.timeout)
+	}
+	return n, err
+}
+
 var errInfiniteRetry = errors.New("")
 
 func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int64, error) {
-	resp, err := d.cfg.HttpClient(d.ctx, params)
+	ctx := d.ctx
+	var w io.Writer = ch.buf
+	var stalled atomic.Bool
+	if d.cfg.PartStallTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(d.ctx)
+		defer cancel()
+		timer := time.AfterFunc(d.cfg.PartStallTimeout, func() {
+			stalled.Store(true)
+			cancel()
+		})
+		defer timer.Stop()
+		w = &progressWriter{w: ch.buf, timer: timer, timeout: d.cfg.PartStallTimeout}
+	}
+	start := time.Now()
+	reused := false
+	if log.IsLevelEnabled(log.DebugLevel) {
+		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
+		})
+	}
+
+	resp, err := d.cfg.HttpClient(ctx, params)
+	if err != nil && stalled.Load() && d.ctx.Err() == nil {
+		log.Debugf("chunk_%d no response within %v, retrying", ch.id, d.cfg.PartStallTimeout)
+		return 0, &errNeedRetry{errPartStalled}
+	}
 	if err != nil {
 		statusCode, ok := errs.UnwrapOrSelf(err).(HttpStatusCodeError)
 		if !ok {
@@ -500,9 +549,16 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 		}
 	}
 	_ = d.sendChunkTask(true)
-	n, err := utils.CopyWithBuffer(ch.buf, resp.Body)
+	headers := time.Since(start)
+	n, err := utils.CopyWithBuffer(w, resp.Body)
+	// logged by downloadChunk after the bytes are counted, so logging
+	// never delays d.written behind the reader
+	ch.timing = partTiming{start: params.Range.Start, n: n, headers: headers, total: time.Since(start), reused: reused}
 
 	if err != nil {
+		if stalled.Load() && d.ctx.Err() == nil {
+			err = errPartStalled
+		}
 		return n, &errNeedRetry{err}
 	}
 	if n != ch.size {
@@ -572,6 +628,20 @@ type chunk struct {
 	id    int
 
 	newConcurrency bool
+	timing         partTiming // last attempt, for debug logging
+}
+
+type partTiming struct {
+	start          int64
+	n              int64
+	headers, total time.Duration
+	reused         bool
+}
+
+func (t partTiming) String() string {
+	return fmt.Sprintf("from %d: %d bytes, headers %.2fs, total %.2fs, %.2f MB/s, reused conn %v",
+		t.start, t.n, t.headers.Seconds(), t.total.Seconds(),
+		float64(t.n)/max(t.total.Seconds(), 1e-6)/float64(utils.MB), t.reused)
 }
 
 func DefaultHttpRequestFunc(ctx context.Context, params *HttpRequestParams) (*http.Response, error) {

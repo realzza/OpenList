@@ -34,6 +34,7 @@ func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, 
 		down := net.NewDownloader(func(d *net.Downloader) {
 			d.Concurrency = link.Concurrency
 			d.PartSize = link.PartSize
+			d.PartStallTimeout = link.PartStallTimeout
 			d.HttpClient = net.GetRangeReaderHttpRequestFunc(link.RangeReader)
 		})
 		rangeReader := func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
@@ -54,6 +55,7 @@ func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, 
 		down := net.NewDownloader(func(d *net.Downloader) {
 			d.Concurrency = link.Concurrency
 			d.PartSize = link.PartSize
+			d.PartStallTimeout = link.PartStallTimeout
 			d.HttpClient = func(ctx context.Context, params *net.HttpRequestParams) (*http.Response, error) {
 				if ServerDownloadLimit == nil {
 					return net.DefaultHttpRequestFunc(ctx, params)

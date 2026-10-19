@@ -36,6 +36,8 @@ type Link struct {
 	Concurrency   int   `json:"concurrency"`
 	PartSize      int   `json:"part_size"`
 	ContentLength int64 `json:"content_length"` // 转码视频、缩略图
+	// resume a part on a new connection after this long without data; 0 = never
+	PartStallTimeout time.Duration `json:"-"`
 
 	utils.SyncClosers `json:"-"`
 	// 如果SyncClosers中的资源被关闭后Link将不可用，则此值应为 true
@@ -50,6 +52,7 @@ func (l *Link) Clone() *Link {
 		RangeReader:      l.RangeReader,
 		Concurrency:      l.Concurrency,
 		PartSize:         l.PartSize,
+		PartStallTimeout: l.PartStallTimeout,
 		ContentLength:    l.ContentLength,
 		SyncClosers:      utils.NewSyncClosers(l),
 		RequireReference: l.RequireReference,
