@@ -355,6 +355,17 @@ func NewHttpClient() *http.Client {
 	transport := &http.Transport{
 		Proxy:           http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: conf.Conf.TlsInsecureSkipVerify},
+		// Multi-thread downloads keep several connections to one host busy.
+		// With the default of 2 idle connections per host, every other part
+		// paid a new TCP+TLS handshake and slow start; without timeouts a
+		// hung connect blocked a part for minutes.
+		DialContext: (&gonet.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     90 * time.Second,
 	}
 
 	SetProxyIfConfigured(transport)
