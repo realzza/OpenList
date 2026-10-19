@@ -12,6 +12,8 @@ type Addition struct {
 	OrderDirection        string `json:"order_direction" type:"select" options:"asc,desc" default:"asc"`
 	UseTransCodingAddress bool   `json:"use_transcoding_address" help:"You can watch the transcoded video and support 302 redirection" required:"true" default:"false"`
 	OnlyListVideoFile     bool   `json:"only_list_video_file" default:"false"`
+	DownConcurrency       int    `json:"down_concurrency" type:"number" default:"3" help:"parallel range requests per proxied download (1-16)"`
+	DownPartSize          int    `json:"down_part_size" type:"number" default:"10" help:"size of each range request, in MB"`
 	AdditionVersion       int
 }
 

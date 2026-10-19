@@ -131,9 +131,24 @@ func (d *QuarkOrUC) getDownloadLink(file model.Obj) (*model.Link, error) {
 			"Referer":    []string{d.conf.referer},
 			"User-Agent": []string{ua},
 		},
-		Concurrency: 3,
-		PartSize:    10 * utils.MB,
+		Concurrency: d.downConcurrency(),
+		PartSize:    d.downPartSize(),
 	}, nil
+}
+
+// Download tuning; zero values keep the previous fixed 3 x 10 MB.
+func (d *QuarkOrUC) downConcurrency() int {
+	if d.DownConcurrency <= 0 {
+		return 3
+	}
+	return min(d.DownConcurrency, 16)
+}
+
+func (d *QuarkOrUC) downPartSize() int {
+	if d.DownPartSize <= 0 {
+		return 10 * utils.MB
+	}
+	return d.DownPartSize * utils.MB
 }
 
 func (d *QuarkOrUC) getTranscodingLink(file model.Obj) (*model.Link, error) {
@@ -158,8 +173,8 @@ func (d *QuarkOrUC) getTranscodingLink(file model.Obj) (*model.Link, error) {
 			return &model.Link{
 				URL:           info.VideoInfo.URL,
 				ContentLength: info.VideoInfo.Size,
-				Concurrency:   3,
-				PartSize:      10 * utils.MB,
+				Concurrency:   d.downConcurrency(),
+				PartSize:      d.downPartSize(),
 			}, nil
 		}
 	}
