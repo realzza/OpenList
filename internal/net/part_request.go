@@ -105,7 +105,7 @@ type partTrace struct {
 	hedge                               bool
 	dns, conn, tlsDone, wrote, firstOut time.Duration
 	ip                                  string
-	reused                              bool
+	reused, connected                   bool
 	dialing                             map[string]time.Duration
 	dials                               []string
 }
@@ -124,11 +124,17 @@ func (t *partTrace) attach(ctx context.Context) context.Context {
 			t.mu.Unlock()
 		},
 		ConnectStart: func(_, addr string) {
+			if isDNSDial(addr) {
+				return
+			}
 			t.mu.Lock()
 			t.dialing[addr] = t.since()
 			t.mu.Unlock()
 		},
 		ConnectDone: func(_, addr string, err error) {
+			if isDNSDial(addr) {
+				return
+			}
 			t.mu.Lock()
 			defer t.mu.Unlock()
 			took := t.since() - t.dialing[addr]
@@ -137,6 +143,7 @@ func (t *partTrace) attach(ctx context.Context) context.Context {
 			if err != nil {
 				t.dials = append(t.dials, fmt.Sprintf("%s err %.2fs", ip, took.Seconds()))
 			} else {
+				t.connected = true
 				t.dials = append(t.dials, fmt.Sprintf("%s %.2fs", ip, took.Seconds()))
 			}
 		},
@@ -165,6 +172,13 @@ func (t *partTrace) attach(ctx context.Context) context.Context {
 			t.mu.Unlock()
 		},
 	})
+}
+
+// isDNSDial: the resolver's own UDP "dials" to its server show up in the
+// same hooks; they aren't the edge.
+func isDNSDial(addr string) bool {
+	_, port, _ := gonet.SplitHostPort(addr)
+	return port == "53"
 }
 
 func (t *partTrace) remoteIP() string {
@@ -210,9 +224,9 @@ func (t *partTrace) String() string {
 		switch {
 		case t.conn == 0 && t.dns == 0 && len(t.dials) == 0 && len(t.dialing) == 0:
 			stuck = "dns"
-		case t.conn == 0 && len(t.dialing) > 0:
+		case t.conn == 0 && len(t.dialing) > 0 && !t.connected:
 			stuck = "connect"
-		case t.conn == 0 && t.tlsDone == 0 && len(t.dials) > 0:
+		case t.conn == 0 && t.tlsDone == 0 && t.connected:
 			stuck = "tls"
 		case t.conn == 0:
 			stuck = "getconn"
