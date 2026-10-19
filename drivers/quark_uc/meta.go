@@ -17,6 +17,7 @@ type Addition struct {
 	DownStallTimeout      int    `json:"down_stall_timeout" type:"number" default:"0" help:"seconds without data before a range request is resumed on a new connection; 0 disables"`
 	DownHeadParts         int    `json:"down_head_parts" type:"number" default:"0" help:"number of smaller parts at the start of each proxied download, so a player opening or seeking gets its first MB from several connections; 0 disables"`
 	DownHeadPartSize      int    `json:"down_head_part_size" type:"number" default:"3" help:"size of those first parts, in MB (below down_part_size)"`
+	DownLaunchParts       int    `json:"down_launch_parts" type:"number" default:"0" help:"number of parts requested together once the first one answers (head parts and the first full parts, up to down_concurrency); 0 adds one per answered request"`
 	DownLinkCache         int    `json:"down_link_cache" type:"number" default:"0" help:"seconds to reuse a download link across requests for the same file (players open a file with several requests); 0 refetches it for each request"`
 	AdditionVersion       int
 }

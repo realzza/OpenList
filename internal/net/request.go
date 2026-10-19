@@ -63,6 +63,13 @@ type Downloader struct {
 	HeadParts    int
 	HeadPartSize int
 
+	// LaunchParts parts in all are requested as soon as the first part
+	// answers (head parts and the first full parts alike, within
+	// Concurrency), instead of one more per answered request. The parts a
+	// reader reaches after the head then have the head's whole download time
+	// to fill. Zero, one or two keep the upstream ramp.
+	LaunchParts int
+
 	//RequestParam        HttpRequestParams
 	HttpClient HttpRequestFunc
 
@@ -137,7 +144,7 @@ type downloader struct {
 	delayMu     sync.Mutex
 	readingID   atomic.Int64  // 正在被读取的id
 	partRate    atomic.Uint64 // float64 bits: moving average of finished parts' bytes/s
-	headSent    atomic.Bool   // the head parts have been requested together
+	launched    atomic.Bool   // the LaunchParts parts have been requested together
 
 	hc *hcache.HybridCache
 }
@@ -664,10 +671,10 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 		}
 	}
 	_ = d.sendChunkTask(true)
-	if d.cfg.HeadParts > 2 && d.headSent.CompareAndSwap(false, true) {
-		// The link answers, so request the rest of the head now rather than
-		// one more part per answered request: it then fills in parallel.
-		for range d.cfg.HeadParts - 2 {
+	if d.cfg.LaunchParts > 2 && d.launched.CompareAndSwap(false, true) {
+		// The link answers, so request the next parts now rather than one
+		// more per answered request: they then fill in parallel with the head.
+		for range d.cfg.LaunchParts - 2 {
 			_ = d.sendChunkTask(true)
 		}
 	}

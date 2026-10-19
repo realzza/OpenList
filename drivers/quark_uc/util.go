@@ -138,6 +138,7 @@ func (d *QuarkOrUC) getDownloadLink(file model.Obj) (*model.Link, error) {
 		PartStallTimeout: d.downStallTimeout(),
 		HeadParts:        max(d.DownHeadParts, 0),
 		HeadPartSize:     max(d.DownHeadPartSize, 0) * utils.MB,
+		LaunchParts:      max(d.DownLaunchParts, 0),
 		Expiration:       d.downLinkCache(),
 	}, nil
 }
@@ -200,6 +201,7 @@ func (d *QuarkOrUC) getTranscodingLink(file model.Obj) (*model.Link, error) {
 				PartStallTimeout: d.downStallTimeout(),
 				HeadParts:        max(d.DownHeadParts, 0),
 				HeadPartSize:     max(d.DownHeadPartSize, 0) * utils.MB,
+				LaunchParts:      max(d.DownLaunchParts, 0),
 			}, nil
 		}
 	}
