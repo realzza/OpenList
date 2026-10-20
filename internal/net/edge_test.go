@@ -9,6 +9,7 @@ import (
 	gonet "net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,6 +78,47 @@ func TestEdgeDialRacesAnotherCluster(t *testing.T) {
 	}
 	if (*dialed)[0] != "10.1.0.7:443" {
 		t.Errorf("second dial started with %s", (*dialed)[0])
+	}
+}
+
+// Marking a cluster bad closes its connections that are idle or waiting
+// (a dead edge sends no reset, so the pool would hand them out again), and
+// leaves other clusters' connections alone.
+func TestEdgeMarkBadClosesSilentConns(t *testing.T) {
+	old := edgeSilent
+	edgeSilent = 20 * time.Millisecond
+	defer func() { edgeSilent = old }()
+	e, _ := testEdges(t, []string{"10.1.0.1"}, nil)
+	ctx := WithEdgeFailover(context.Background(), 50*time.Millisecond)
+	dead, err := e.DialTLSContext(ctx, "tcp", "cdn.test:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dead.Close()
+	e.lookup = func(context.Context, string) ([]string, error) { return []string{"10.2.0.1"}, nil }
+	other, err := e.DialTLSContext(ctx, "tcp", "cdn.test:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	time.Sleep(40 * time.Millisecond)
+	e.mark("cdn.test", "10.1.0.1", false)
+	read := func(c gonet.Conn) error {
+		_ = c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, err := c.Read(make([]byte, 1))
+		return err
+	}
+	if err := read(dead); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("connection to the bad cluster still open: %v", err)
+	}
+	if err := read(other); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("connection to another cluster: %v, want it open", err)
+	}
+	e.mu.Lock()
+	n := len(e.nets["cdn.test"]["10.1.0.0"].conns)
+	e.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d connections still tracked for the bad cluster", n)
 	}
 }
 

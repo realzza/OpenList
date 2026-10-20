@@ -614,6 +614,7 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 			return 0, &errNeedRetry{errPartSlow}
 		}
 		log.Debugf("chunk_%d no response within %v, retrying; %v", ch.id, d.cfg.PartStallTimeout, trace)
+		d.markEdge(params, trace)
 		return 0, &errNeedRetry{errPartStalled}
 	}
 	if err != nil {
@@ -699,6 +700,7 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 				err = errPartSlow
 			} else if stalled.Load() {
 				err = errPartStalled
+				d.markEdge(params, trace)
 			}
 		}
 		return n, &errNeedRetry{err}

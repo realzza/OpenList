@@ -60,11 +60,9 @@ func (d *downloader) request(ctx context.Context, params *HttpRequestParams, ch 
 		case <-hedge:
 			hedge = nil
 			first := traces[0]
-			if ip := first.remoteIP(); ip != "" && d.cfg.EdgeFailover > 0 {
-				if u, err := url.Parse(params.URL); err == nil {
-					MarkEdgeBad(u.Hostname(), ip)
-				}
-			}
+			// mark first: that closes the edge's silent pooled connections,
+			// so the hedge doesn't pick one of them up
+			d.markEdge(params, first)
 			log.Debugf("chunk_%d no headers within %v, hedging; %v", ch.id, d.cfg.HeaderTimeout, first)
 			launch()
 			running++
@@ -85,6 +83,19 @@ func (d *downloader) request(ctx context.Context, params *HttpRequestParams, ch 
 			if running == 0 {
 				return nil, a.trace, func() {}, a.err
 			}
+		}
+	}
+}
+
+// markEdge: with edge failover on, the edge a part request waited on in
+// vain is tried last for a while, and its silent connections are closed.
+func (d *downloader) markEdge(params *HttpRequestParams, t *partTrace) {
+	if d.cfg.EdgeFailover <= 0 {
+		return
+	}
+	if ip := t.remoteIP(); ip != "" {
+		if u, err := url.Parse(params.URL); err == nil {
+			MarkEdgeBad(u.Hostname(), ip)
 		}
 	}
 }

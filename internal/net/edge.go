@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -61,6 +62,39 @@ var edgeAltResolvers = []string{"1.1.1.1:53", "8.8.8.8:53"}
 type edgeNet struct {
 	ok, bad time.Time
 	ips     []string
+	conns   map[*edgeConn]struct{} // open connections to it
+}
+
+// A dead edge drops packets without a reset, so the connection pool can't
+// tell its idle connections from live ones, and a hedge or retry may pick
+// one up. When a cluster is marked bad, its connections that have read
+// nothing for this long (idle in the pool, or waiting on it) are closed.
+var edgeSilent = time.Second
+
+// edgeConn is a TCP connection from the edge dialer (under its TLS), with
+// the time it last received data.
+type edgeConn struct {
+	gonet.Conn
+	lastRead atomic.Int64
+	onClose  func(*edgeConn)
+	once     sync.Once
+}
+
+func (c *edgeConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.lastRead.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (c *edgeConn) Close() error {
+	c.once.Do(func() { c.onClose(c) })
+	return c.Conn.Close()
+}
+
+func (c *edgeConn) silentFor() time.Duration {
+	return time.Since(time.Unix(0, c.lastRead.Load()))
 }
 
 type edgeDialer struct {
@@ -191,6 +225,12 @@ func containsIP(ips []string, ip string) bool {
 }
 
 func (e *edgeDialer) mark(host, ip string, ok bool) {
+	var silent []*edgeConn
+	defer func() {
+		for _, c := range silent {
+			_ = c.Close()
+		}
+	}()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	nets := e.nets[host]
@@ -209,9 +249,50 @@ func (e *edgeDialer) mark(host, ip string, ok bool) {
 	}
 	if ok {
 		n.ok = e.now()
-	} else {
-		n.bad = e.now()
+		return
 	}
+	n.bad = e.now()
+	for c := range n.conns {
+		if c.silentFor() >= edgeSilent {
+			silent = append(silent, c)
+		}
+	}
+	if len(silent) > 0 {
+		log.Debugf("edge %s marked bad: closing %d silent connections", c24(ip), len(silent))
+	}
+}
+
+func c24(ip string) string { return edgeCluster(ip) + "/24" }
+
+// track registers a new connection to host's edge at ip.
+func (e *edgeDialer) track(host, ip string, raw gonet.Conn) *edgeConn {
+	c := &edgeConn{Conn: raw}
+	c.lastRead.Store(time.Now().UnixNano())
+	cluster := edgeCluster(ip)
+	c.onClose = func(c *edgeConn) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if n := e.nets[host][cluster]; n != nil {
+			delete(n.conns, c)
+		}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	nets := e.nets[host]
+	if nets == nil {
+		nets = map[string]*edgeNet{}
+		e.nets[host] = nets
+	}
+	n := nets[cluster]
+	if n == nil {
+		n = &edgeNet{}
+		nets[cluster] = n
+	}
+	if n.conns == nil {
+		n.conns = map[*edgeConn]struct{}{}
+	}
+	n.conns[c] = struct{}{}
+	return c
 }
 
 // MarkEdgeBad records that the edge behind addr (ip:port, or ip) didn't
@@ -401,6 +482,9 @@ func (e *edgeDialer) dialOne(ctx context.Context, network, addr, host string) (g
 	raw, err := e.dialTCP(ctx, network, addr)
 	if err != nil {
 		return nil, err
+	}
+	if ip, _, err := gonet.SplitHostPort(addr); err == nil && ip != host && gonet.ParseIP(ip) != nil {
+		raw = e.track(host, ip, raw)
 	}
 	cfg := e.tlsConfig.Clone()
 	cfg.ServerName = host
